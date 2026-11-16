@@ -1,0 +1,63 @@
+# Builds the image from a locally built mlflow-oidc-auth wheel instead of the PyPI release pinned
+# in pyproject.toml / uv.lock. Same stages, user and entrypoint as ./Dockerfile.
+#
+# The wheel comes in through a named build context, so nothing is copied into this repository:
+#
+#   docker build -f Dockerfile.local \
+#     --build-context wheels=/path/to/mlflow-oidc-auth/dist \
+#     -t mlflow-oidc-auth:local .
+ARG PYTHON_VERSION=3.12-slim
+FROM python:${PYTHON_VERSION} AS base
+
+LABEL org.opencontainers.image.source="https://github.com/mlflow-oidc/mlflow-tracking-server-docker"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.description="MLFlow tracking server with OpenID Connect authentication (local plugin build)"
+
+RUN adduser --disabled-password --gecos '' python
+ENV PYTHONUNBUFFERED=1
+
+FROM base AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libffi-dev \
+    libssl-dev \
+    zlib1g-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv wheel
+
+# The skill registry needs MLflow 3.18+; the plugin itself accepts mlflow>=3.16,<4.
+ARG MLFLOW_VERSION=3.18.0
+# Extras of the local wheel to install (the 5.x "caching-redis" and "fastapi" extras no longer exist).
+ARG PLUGIN_EXTRAS=full,cache
+
+WORKDIR /mlflow
+RUN chown python:python /mlflow
+USER python
+
+RUN uv venv /mlflow/.venv
+
+# Exactly one wheel is expected in the "wheels" build context.
+RUN --mount=type=bind,from=wheels,target=/wheels \
+    set -eu; \
+    wheel="$(ls /wheels/mlflow_oidc_auth-*.whl)"; \
+    [ "$(echo "$wheel" | wc -l)" -eq 1 ] || { echo "expected exactly one mlflow_oidc_auth wheel, found: $wheel" >&2; exit 1; }; \
+    uv pip install --no-cache --python /mlflow/.venv/bin/python \
+        "mlflow_oidc_auth[${PLUGIN_EXTRAS}] @ file://${wheel}" \
+        "mlflow==${MLFLOW_VERSION}" \
+        "boto3>=1.37.34" \
+        "azure-storage-blob>=12.25.1" \
+        "azure-identity>=1.21.0" \
+        "google-cloud-storage>=3.1.0" \
+        "psycopg2-binary==2.9.10"
+
+FROM base AS final
+USER python
+WORKDIR /mlflow
+COPY --from=builder --chown=python:python /mlflow /mlflow
+ENV PATH=/mlflow/.venv/bin:$PATH
+ENV OAUTHLIB_INSECURE_TRANSPORT=1
+EXPOSE 5000
+CMD ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000", "--app-name", "oidc-auth", "--backend-store-uri", "sqlite:///mlflow.db", "--default-artifact-root", "/mlflow/artifacts"]
